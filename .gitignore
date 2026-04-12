@@ -1,0 +1,13 @@
+# Large dataset files
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.json
+*.xml
+*.parquet
+*.pkl
+*.pickle
+
+# Dataset directories
+datasets/
