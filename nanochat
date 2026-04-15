@@ -1,0 +1,177 @@
+# =============================================================================
+# MedAssist — NanoChat Inference Setup
+# Loads sdobson/nanochat 561M checkpoint and starts chat_web server
+# =============================================================================
+import os, shutil, subprocess, sys, time, pathlib
+import torch
+
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
+ROOT = "/content/nanochat"
+PORT = 8000
+
+env = os.environ.copy()
+env["PYTHONPATH"] = ROOT
+env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
+def sh(cmd, cwd=None, check=True):
+    p = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, env=env)
+    if p.stdout: print(p.stdout[-3000:])
+    if p.stderr: print(p.stderr[-1500:])
+    if check and p.returncode != 0:
+        raise RuntimeError(f"Command failed: {' '.join(cmd)} (rc={p.returncode})")
+    return p
+
+
+if not torch.cuda.is_available():
+    raise RuntimeError("Runtime → Change runtime type → T4 GPU")
+
+torch.cuda.empty_cache()
+total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+free  = torch.cuda.mem_get_info()[0] / 1024**3
+print(f"✅ GPU : {torch.cuda.get_device_name(0)}")
+print(f"   RAM : {free:.1f} GB free / {total:.1f} GB total")
+
+if free < 3.0:
+    raise RuntimeError(
+        f"❌ Only {free:.1f} GB free — need at least 3 GB.\n"
+        "👉 Runtime → Disconnect and delete runtime → reconnect → rerun."
+    )
+
+
+if os.path.isdir(ROOT):
+    shutil.rmtree(ROOT)
+sh(["git", "clone", "--depth", "1", "https://github.com/karpathy/nanochat.git", ROOT])
+print("✅ Cloned nanochat")
+
+
+sh([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "pip", "setuptools", "wheel"])
+sh([sys.executable, "-m", "pip", "install", "-q",
+    "datasets>=4.0.0", "fastapi>=0.117.1", "kernels>=0.11.7",
+    "psutil>=7.1.0", "rustbpe>=0.1.0", "tiktoken>=0.11.0",
+    "tokenizers>=0.22.0", "uvicorn>=0.36.0", "wandb>=0.21.3",
+    "huggingface_hub", "filelock",
+])
+print("✅ Dependencies installed")
+
+
+from huggingface_hub import snapshot_download
+
+base     = os.path.expanduser("~/.cache/nanochat")
+tok_dir  = os.path.join(base, "tokenizer")
+ckpt_dir = os.path.join(base, "chatsft_checkpoints", "d20")
+os.makedirs(tok_dir,  exist_ok=True)
+os.makedirs(ckpt_dir, exist_ok=True)
+
+print("Downloading sdobson/nanochat checkpoint...")
+local_dir = snapshot_download(repo_id="sdobson/nanochat")
+for name, dest in [
+    ("tokenizer.pkl",    tok_dir),
+    ("token_bytes.pt",   tok_dir),
+    ("model_000650.pt",  ckpt_dir),
+    ("meta_000650.json", ckpt_dir),
+]:
+    src = os.path.join(local_dir, name)
+    assert os.path.isfile(src), f"❌ Missing: {src}"
+    shutil.copy2(src, os.path.join(dest, name))
+print("✅ Checkpoint ready at:", ckpt_dir)
+
+
+cm_path = os.path.join(ROOT, "nanochat", "checkpoint_manager.py")
+cm = pathlib.Path(cm_path).read_text(encoding="utf-8")
+
+TARGET = "model.load_state_dict(model_data, strict=True, assign=True)"
+REPLACEMENT = (
+    "incompat = model.load_state_dict(model_data, strict=False, assign=True)\n"
+    "    try:\n"
+    "        missing = set(getattr(incompat, 'missing_keys', []) or [])\n"
+    "        if missing:\n"
+    "            with torch.no_grad():\n"
+    "                for n, p in model.named_parameters():\n"
+    "                    if any(k in n for k in ('value_embeds','ve_gate','smear_','backout_')):\n"
+    "                        if n in missing or any(mk in n for mk in missing):\n"
+    "                            p.zero_()\n"
+    "    except Exception:\n"
+    "        pass\n"
+)
+if TARGET in cm:
+    cm = cm.replace(TARGET, REPLACEMENT)
+    print("✅ Patched checkpoint_manager.py: strict=False")
+elif "strict=True" in cm:
+    cm = cm.replace("strict=True", "strict=False")
+    print("✅ Patched checkpoint_manager.py: fallback strict=False")
+else:
+    print("ℹ️  checkpoint_manager.py: no patch needed")
+pathlib.Path(cm_path).write_text(cm, encoding="utf-8")
+
+# ── 6) Patch flash_attention.py (fix float32 vs bfloat16 dtype mismatch) ──────
+fa_path = os.path.join(ROOT, "nanochat", "flash_attention.py")
+fa_lines = pathlib.Path(fa_path).read_text(encoding="utf-8").splitlines()
+
+fixed = []
+for line in fa_lines:
+    if line.strip().startswith("return F.scaled_dot_product_attention("):
+        indent = len(line) - len(line.lstrip())
+        fixed.append(" " * indent + "q = q.to(k.dtype)  # fix float32/bfloat16 mismatch")
+    fixed.append(line)
+
+pathlib.Path(fa_path).write_text("\n".join(fixed), encoding="utf-8")
+print("✅ Patched flash_attention.py: dtype cast added")
+
+
+subprocess.run(["pkill", "-f", "scripts.chat_web"], capture_output=True)
+time.sleep(1)
+
+log_path = "/tmp/nanochat_web.log"
+open(log_path, "w").close()
+
+subprocess.Popen(
+    [sys.executable, "-m", "scripts.chat_web",
+     "-i", "sft", "-g", "d20", "-s", "650",
+     "--host", "0.0.0.0", "--port", str(PORT),
+     "--device-type", "cuda"],
+    stdout=open(log_path, "w", buffering=1),
+    stderr=subprocess.STDOUT,
+    cwd=ROOT, env=env,
+)
+print("⏳ Waiting for chat_web to start (up to 4 min)...")
+
+ready = False
+for i in range(240):
+    time.sleep(1)
+    tail = pathlib.Path(log_path).read_text(errors="ignore")
+    if "Uvicorn running" in tail or "Server ready" in tail:
+        ready = True
+        break
+    if "Traceback" in tail or "OutOfMemory" in tail:
+        print("\n❌ chat_web crashed!\n", tail[-4000:])
+        raise RuntimeError("👉 Runtime → Disconnect and delete runtime → reconnect → rerun.")
+    if i % 30 == 0 and i > 0:
+        print(f"  Still loading... ({i}s elapsed)")
+
+if not ready:
+    print("⚠️  Server didn't report ready in 240s.")
+    print(pathlib.Path(log_path).read_text(errors="ignore")[-2000:])
+else:
+    print("✅ Server is up!")
+
+    
+    time.sleep(1)
+    import json
+    test = subprocess.run(
+        ["curl", "-s", "-X", "POST", "http://localhost:8000/chat/completions",
+         "-H", "Content-Type: application/json",
+         "-d", '{"messages":[{"role":"user","content":"What is a fever?"}]}'],
+        capture_output=True, text=True, timeout=30
+    )
+    full_text = ""
+    for line in test.stdout.splitlines():
+        if line.startswith("data: "):
+            try: full_text += json.loads(line[6:]).get("token", "")
+            except: pass
+    print(f"\n🧪 Test prompt : What is a fever?")
+    print(f"💬 Response    : {full_text[:300]}")
+
+    from google.colab.output import eval_js
+    url = eval_js(f"google.colab.kernel.proxyPort({PORT})")
+    print(f"\n✅ nanochat is live! Open in a new tab:\n{url}")
